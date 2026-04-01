@@ -1,0 +1,25 @@
+listen: ":11435"
+
+backends:
+  # Models are auto-discovered from each backend at startup.
+  # Backend order sets failover priority: first backend is tried first.
+  # If it's down or returns an error, the next backend is tried automatically.
+
+  # ── zbook NPU (FastFlowLM, OpenAI-compatible API) ── priority 1
+  # AMD XDNA2 NPU via FastFlowLM. 20-80 tok/s at <2W.
+  - name: zbook-npu
+    type: openai
+    url: http://zbook:52625/v1
+    api_key: flm
+
+  # ── zbook (Ollama, Strix Halo iGPU / ~96GB unified memory) ── priority 2
+  - name: zbook
+    type: ollama
+    url: http://zbook:11434
+
+  # ── xps (Ollama, discrete GPU) ── priority 3
+  - name: xps
+    type: ollama
+    url: http://localhost:11434
+    models:
+      - qwen3.5:9b   # primary here; zbook added as failover via discovery
