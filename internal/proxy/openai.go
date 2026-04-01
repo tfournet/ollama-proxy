@@ -108,6 +108,7 @@ func (p *Proxy) forwardChatToOpenAI(w http.ResponseWriter, r *http.Request, body
 
 	resp, err := http.DefaultClient.Do(httpReq)
 	if err != nil {
+		p.markDown(b.Name)
 		http.Error(w, "upstream error: "+err.Error(), http.StatusBadGateway)
 		return
 	}

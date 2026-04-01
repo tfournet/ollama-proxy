@@ -10,14 +10,16 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/tim/ollama-proxy/internal/config"
 )
 
 type Proxy struct {
 	backends []config.Backend
-	routes   map[string][]config.Backend      // model name → backends in priority order
-	rp       map[string]*httputil.ReverseProxy // backend name → reverse proxy
+	routes   map[string][]config.Backend       // model name → backends in priority order
+	rp       map[string]*httputil.ReverseProxy  // backend name → reverse proxy
+	healthy  map[string]*atomic.Bool            // backend name → health state
 }
 
 func New(cfg *config.Config) (*Proxy, error) {
@@ -25,6 +27,7 @@ func New(cfg *config.Config) (*Proxy, error) {
 		backends: cfg.Backends,
 		routes:   make(map[string][]config.Backend),
 		rp:       make(map[string]*httputil.ReverseProxy),
+		healthy:  make(map[string]*atomic.Bool),
 	}
 
 	for _, b := range cfg.Backends {
@@ -32,25 +35,36 @@ func New(cfg *config.Config) (*Proxy, error) {
 		if err != nil {
 			return nil, fmt.Errorf("backend %q: invalid url %q: %w", b.Name, b.URL, err)
 		}
+
+		b := b // capture for closure
 		rp := httputil.NewSingleHostReverseProxy(u)
 		rp.ModifyResponse = stripOllamaVaryHeader
+		rp.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+			slog.Warn("backend transport error", "backend", b.Name, "error", err)
+			p.markDown(b.Name)
+			http.Error(w, "upstream unavailable", http.StatusBadGateway)
+		}
 		p.rp[b.Name] = rp
 
-		// Explicit model list: append backend in config order for failover.
+		h := &atomic.Bool{}
+		h.Store(true) // assume healthy until first poll
+		p.healthy[b.Name] = h
+
+		// Explicit model list: append backend in config order for failover priority.
 		for _, m := range b.Models {
 			p.routes[m] = append(p.routes[m], b)
 		}
 	}
 
-	// Auto-discover models from each backend. Explicit entries above take
-	// priority; discovered models only fill in gaps.
 	p.discover()
+	p.startHealthLoop()
 
 	return p, nil
 }
 
-// discover queries each backend for its model list and registers any models
-// not already in the routing table.
+// discover queries each backend for its model list and populates the routing table.
+// Backends are appended in config order so priority is preserved across all backends
+// that carry the same model.
 func (p *Proxy) discover() {
 	for _, b := range p.backends {
 		var names []string
@@ -84,7 +98,7 @@ func (p *Proxy) discover() {
 
 		added := 0
 		for _, name := range names {
-			// Append this backend only if not already listed (avoid duplicates
+			// Append this backend only if not already listed (avoids duplicates
 			// when explicit model list and auto-discovery overlap).
 			already := false
 			for _, existing := range p.routes[name] {
@@ -116,16 +130,17 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.handleShow(w, r)
 	default:
 		// For all other endpoints (pull, push, delete, embed, etc.),
-		// forward to the first backend.
-		if len(p.backends) == 0 {
-			http.Error(w, "no backends configured", http.StatusServiceUnavailable)
+		// forward to the first healthy backend.
+		b, ok := p.pickBackend(p.backends)
+		if !ok {
+			http.Error(w, "no healthy backends", http.StatusServiceUnavailable)
 			return
 		}
-		p.forward(w, r, p.backends[0])
+		p.forward(w, r, b)
 	}
 }
 
-// handleChat routes POST /api/chat based on the model field.
+// handleChat routes POST /api/chat to the first healthy backend for the model.
 func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
 	body, model, err := peekModel(r)
 	if err != nil {
@@ -133,59 +148,23 @@ func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	backends := p.routes[model]
-	if len(backends) == 0 {
-		slog.Warn("unknown model, using first backend", "model", model)
-		if len(p.backends) == 0 {
-			http.Error(w, "no backends configured", http.StatusServiceUnavailable)
-			return
-		}
-		backends = []config.Backend{p.backends[0]}
+	backend, ok := p.resolveBackend(model)
+	if !ok {
+		http.Error(w, "no healthy backend for model: "+model, http.StatusServiceUnavailable)
+		return
 	}
 
-	p.tryChatBackends(w, r, body, model, backends)
-}
+	slog.Debug("routing chat", "model", model, "backend", backend.Name)
+	r.Body = io.NopCloser(strings.NewReader(string(body)))
 
-// tryChatBackends attempts each backend in order, falling back on error or
-// model-not-found responses.
-func (p *Proxy) tryChatBackends(w http.ResponseWriter, r *http.Request, body []byte, model string, backends []config.Backend) {
-	for i, backend := range backends {
-		last := i == len(backends)-1
-		slog.Debug("routing chat", "model", model, "backend", backend.Name, "attempt", i+1)
-
-		if backend.Type == config.BackendOpenAI {
-			rec := newResponseRecorder()
-			p.forwardChatToOpenAI(rec, r, body, backend)
-			if rec.code < 500 && rec.code != http.StatusNotFound {
-				rec.writeTo(w)
-				return
-			}
-			if !last {
-				slog.Warn("chat failover", "model", model, "from", backend.Name, "status", rec.code)
-				continue
-			}
-			rec.writeTo(w)
-			return
-		}
-
-		if last {
-			r.Body = io.NopCloser(strings.NewReader(string(body)))
-			p.forward(w, r, backend)
-			return
-		}
-
-		rec := newResponseRecorder()
-		r.Body = io.NopCloser(strings.NewReader(string(body)))
-		p.forwardTo(rec, r, backend)
-		if rec.code < 500 && rec.code != http.StatusNotFound {
-			rec.writeTo(w)
-			return
-		}
-		slog.Warn("chat failover", "model", model, "from", backend.Name, "status", rec.code)
+	if backend.Type == config.BackendOpenAI {
+		p.forwardChatToOpenAI(w, r, body, backend)
+		return
 	}
+	p.forward(w, r, backend)
 }
 
-// handleGenerate routes POST /api/generate based on the model field.
+// handleGenerate routes POST /api/generate to the first healthy backend for the model.
 func (p *Proxy) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	body, model, err := peekModel(r)
 	if err != nil {
@@ -193,53 +172,23 @@ func (p *Proxy) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	backends := p.routes[model]
-	if len(backends) == 0 {
-		slog.Warn("unknown model, using first backend", "model", model)
-		if len(p.backends) == 0 {
-			http.Error(w, "no backends configured", http.StatusServiceUnavailable)
-			return
-		}
-		backends = []config.Backend{p.backends[0]}
+	backend, ok := p.resolveBackend(model)
+	if !ok {
+		http.Error(w, "no healthy backend for model: "+model, http.StatusServiceUnavailable)
+		return
 	}
 
-	for i, backend := range backends {
-		last := i == len(backends)-1
-		slog.Debug("routing generate", "model", model, "backend", backend.Name, "attempt", i+1)
+	slog.Debug("routing generate", "model", model, "backend", backend.Name)
+	r.Body = io.NopCloser(strings.NewReader(string(body)))
 
-		if backend.Type == config.BackendOpenAI {
-			if last {
-				p.forwardGenerateToOpenAI(w, r, body, backend)
-				return
-			}
-			rec := newResponseRecorder()
-			p.forwardGenerateToOpenAI(rec, r, body, backend)
-			if rec.code < 500 && rec.code != http.StatusNotFound {
-				rec.writeTo(w)
-				return
-			}
-			slog.Warn("generate failover", "model", model, "from", backend.Name, "status", rec.code)
-			continue
-		}
-
-		if last {
-			r.Body = io.NopCloser(strings.NewReader(string(body)))
-			p.forward(w, r, backend)
-			return
-		}
-
-		rec := newResponseRecorder()
-		r.Body = io.NopCloser(strings.NewReader(string(body)))
-		p.forwardTo(rec, r, backend)
-		if rec.code < 500 && rec.code != http.StatusNotFound {
-			rec.writeTo(w)
-			return
-		}
-		slog.Warn("generate failover", "model", model, "from", backend.Name, "status", rec.code)
+	if backend.Type == config.BackendOpenAI {
+		p.forwardGenerateToOpenAI(w, r, body, backend)
+		return
 	}
+	p.forward(w, r, backend)
 }
 
-// handleShow routes POST /api/show based on the model field.
+// handleShow routes POST /api/show to the first healthy backend for the model.
 // Handles both {"model": "..."} (current API) and {"name": "..."} (legacy).
 func (p *Proxy) handleShow(w http.ResponseWriter, r *http.Request) {
 	body, model, err := peekModelOrName(r)
@@ -248,14 +197,9 @@ func (p *Proxy) handleShow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	backends := p.routes[model]
-	var backend config.Backend
-	if len(backends) > 0 {
-		backend = backends[0]
-	} else if len(p.backends) > 0 {
-		backend = p.backends[0]
-	} else {
-		http.Error(w, "no backends configured", http.StatusServiceUnavailable)
+	backend, ok := p.resolveBackend(model)
+	if !ok {
+		http.Error(w, "no healthy backend for model: "+model, http.StatusServiceUnavailable)
 		return
 	}
 
@@ -263,7 +207,7 @@ func (p *Proxy) handleShow(w http.ResponseWriter, r *http.Request) {
 	p.forward(w, r, backend)
 }
 
-// handleTags aggregates model lists from all backends and merges them.
+// handleTags aggregates model lists from all healthy backends and merges them.
 func (p *Proxy) handleTags(w http.ResponseWriter, r *http.Request) {
 	type tagsResponse struct {
 		Models []ollamaModel `json:"models"`
@@ -274,8 +218,11 @@ func (p *Proxy) handleTags(w http.ResponseWriter, r *http.Request) {
 
 	var wg sync.WaitGroup
 	for _, b := range p.backends {
+		if !p.healthy[b.Name].Load() {
+			continue
+		}
+
 		if b.Type == config.BackendOpenAI {
-			// Convert OpenAI model list to Ollama format.
 			wg.Add(1)
 			go func(b config.Backend) {
 				defer wg.Done()
@@ -315,6 +262,19 @@ func (p *Proxy) handleTags(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(tagsResponse{Models: all})
 }
 
+// resolveBackend returns the first healthy backend for the given model name,
+// falling back to the first healthy backend overall if the model is unknown.
+func (p *Proxy) resolveBackend(model string) (config.Backend, bool) {
+	if backends, ok := p.routes[model]; ok {
+		if b, ok := p.pickBackend(backends); ok {
+			return b, true
+		}
+	}
+	// Model unknown or all known backends down — try any healthy backend.
+	slog.Warn("no healthy backend for model in routes, falling back", "model", model)
+	return p.pickBackend(p.backends)
+}
+
 // forward proxies the request to the given backend unchanged.
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, b config.Backend) {
 	rp, ok := p.rp[b.Name]
@@ -323,37 +283,6 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, b config.Backend
 		return
 	}
 	rp.ServeHTTP(w, r)
-}
-
-// forwardTo proxies to backend into a ResponseWriter (may be a recorder).
-func (p *Proxy) forwardTo(w http.ResponseWriter, r *http.Request, b config.Backend) {
-	p.forward(w, r, b)
-}
-
-// responseRecorder captures a response so we can inspect it before writing to
-// the real ResponseWriter (needed for failover decisions).
-type responseRecorder struct {
-	code    int
-	headers http.Header
-	buf     strings.Builder
-}
-
-func newResponseRecorder() *responseRecorder {
-	return &responseRecorder{code: http.StatusOK, headers: make(http.Header)}
-}
-
-func (r *responseRecorder) Header() http.Header         { return r.headers }
-func (r *responseRecorder) WriteHeader(code int)        { r.code = code }
-func (r *responseRecorder) Write(b []byte) (int, error) { return r.buf.Write(b) }
-
-func (r *responseRecorder) writeTo(w http.ResponseWriter) {
-	for k, vv := range r.headers {
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
-	}
-	w.WriteHeader(r.code)
-	io.WriteString(w, r.buf.String()) //nolint:errcheck
 }
 
 // peekModel reads the request body, extracts the "model" field, and returns
